@@ -24,18 +24,44 @@ badges_bp = Blueprint("badges", __name__)
 # The store is injected by init_badges() at app startup so this feature does
 # not create its own store instance — the whole platform shares one.
 _store = None
+# The enqueue function is injected too, so tests can pass a direct/stub enqueue
+# and production passes the Celery enqueue. Defaults to None (scans disabled).
+_enqueue = None
 _CACHE_SECONDS = 60
 
 
-def init_badges(store):
-    """Inject the shared scan store into this feature."""
-    global _store
+def init_badges(store, enqueue=None):
+    """
+    Inject the shared scan store and (optionally) the scan enqueue function.
+
+    If `enqueue` is None, badges still render from stored grades but no new
+    scans are triggered — useful for a read-only deployment or tests that don't
+    exercise the queue.
+    """
+    global _store, _enqueue
     _store = store
+    _enqueue = enqueue
 
 
-def _svg_response(svg: str) -> Response:
+def _maybe_request_scan(domain: str) -> str | None:
+    """
+    Trigger a background scan for a domain if scanning is wired up.
+
+    Returns the request_scan status ("queued"|"pending"|"fresh"|"blocked") or
+    None if scanning is not enabled in this deployment.
+    """
+    if _store is None or _enqueue is None:
+        return None
+    # Imported here to avoid a hard dependency on the queue module when scanning
+    # is disabled (e.g. a pure badge-rendering deployment).
+    from core.scan_queue import request_scan
+    return request_scan(domain, _store, _enqueue)
+
+
+def _svg_response(svg: str, *, max_age: int = None) -> Response:
     resp = Response(svg, mimetype="image/svg+xml")
-    resp.headers["Cache-Control"] = f"max-age={_CACHE_SECONDS}, public"
+    age = _CACHE_SECONDS if max_age is None else max_age
+    resp.headers["Cache-Control"] = f"max-age={age}, public"
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
@@ -62,13 +88,19 @@ def grade_badge(domain: str):
     elif state is None:
         # Production path — grade comes from the store.
         record = _store.get_grade(domain) if _store else None
-        if record is None:
-            state = "unknown"
-        elif record.is_stale:
-            state = "stale"
-        else:
+        if record is not None and not record.is_stale:
             grade = record.grade
             score = record.score
+        elif record is not None and record.is_stale:
+            # Have an old grade; show stale AND trigger a refresh in the background.
+            state = "stale"
+            _maybe_request_scan(domain)
+        else:
+            # No grade yet. Trigger a scan and show "pending" while it runs.
+            status = _maybe_request_scan(domain)
+            # "blocked" targets (SSRF) get "unknown" — we never reveal internal
+            # detail on a badge, and we never scanned them.
+            state = "pending" if status in ("queued", "pending") else "unknown"
 
     if style == "classic":
         svg = render_badge(grade, score=score, state=state)
@@ -77,7 +109,11 @@ def grade_badge(domain: str):
     else:
         svg = render_seal_badge(grade, score=score, state=state, live=live)
 
-    return _svg_response(svg)
+    # A pending badge must refresh quickly — once the background scan finishes,
+    # the next request should pick up the real grade. Cache it for only 15s.
+    # Everything else uses the normal cache window.
+    max_age = 15 if state == "pending" else None
+    return _svg_response(svg, max_age=max_age)
 
 
 @badges_bp.route("/badges/preview")

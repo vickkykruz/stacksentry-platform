@@ -123,6 +123,19 @@ class ScanStore:
                     source     TEXT NOT NULL DEFAULT 'scan'
                 )
             """)
+            # Tracks in-flight and recent scan jobs, so we can:
+            #   - show a "pending" badge while a first scan runs
+            #   - deduplicate: never queue a domain that is already queued
+            #   - rate-limit: never re-queue a domain scanned very recently
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS scan_jobs (
+                    domain       TEXT PRIMARY KEY,
+                    status       TEXT NOT NULL,   -- queued | running | done | error
+                    requested_at TEXT NOT NULL,   -- ISO 8601 UTC
+                    updated_at   TEXT NOT NULL,   -- ISO 8601 UTC
+                    detail       TEXT             -- error message, if any
+                )
+            """)
 
     # ── Read path (public) ──────────────────────────────────────────────────
 
@@ -149,6 +162,103 @@ class ScanStore:
             scanned_at=datetime.fromisoformat(row["scanned_at"]),
             scan_id=row["scan_id"],
             source=row["source"],
+        )
+
+    # ── Scan job tracking (pending state + deduplication) ────────────────────
+
+    # Do not re-queue a domain scanned more recently than this. Blunts abuse
+    # (refresh spam can't trigger endless scans) and avoids redundant work.
+    RESCAN_COOLDOWN = timedelta(hours=6)
+
+    def job_status(self, domain: str) -> str | None:
+        """Return the current job status for a domain, or None if no job exists."""
+        norm = normalise_domain(domain)
+        if norm is None:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM scan_jobs WHERE domain = ?", (norm,)
+            ).fetchone()
+        return row["status"] if row else None
+
+    def is_pending(self, domain: str) -> bool:
+        """True if a scan for this domain is queued or running."""
+        return self.job_status(domain) in ("queued", "running")
+
+    def mark_queued(self, domain: str) -> bool:
+        """
+        Mark a domain as queued for scanning.
+
+        Returns True if the caller should actually enqueue a job, False if the
+        domain is already queued/running or was scanned within the cooldown
+        window (deduplication + rate control). This is the single gate that
+        prevents a popular badge from spawning endless duplicate scans.
+        """
+        norm = normalise_domain(domain)
+        if norm is None:
+            return False
+
+        now = datetime.now(timezone.utc)
+
+        # Already in flight? Do not enqueue again.
+        if self.is_pending(norm):
+            return False
+
+        # Scanned very recently? Respect the cooldown.
+        existing = self.get_grade(norm)
+        if existing is not None:
+            age = now - existing.scanned_at
+            if age < self.RESCAN_COOLDOWN:
+                return False
+
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO scan_jobs "
+                "(domain, status, requested_at, updated_at, detail) "
+                "VALUES (?, 'queued', ?, ?, NULL)",
+                (norm, now.isoformat(), now.isoformat()),
+            )
+        return True
+
+    def mark_running(self, domain: str) -> None:
+        self._update_job(domain, "running")
+
+    def mark_done(self, domain: str) -> None:
+        self._update_job(domain, "done")
+
+    def mark_error(self, domain: str, detail: str) -> None:
+        self._update_job(domain, "error", detail=detail)
+
+    def _update_job(self, domain: str, status: str, detail: str | None = None) -> None:
+        norm = normalise_domain(domain)
+        if norm is None:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE scan_jobs SET status = ?, updated_at = ?, detail = ? "
+                "WHERE domain = ?",
+                (status, now, detail, norm),
+            )
+
+    # ── Write path used by the scan worker ───────────────────────────────────
+
+    def save_outcome(self, outcome) -> GradeRecord:
+        """
+        Persist a scan result produced by the platform's own scanner.
+
+        This is the ONLY write path for real grades, and it is called by the
+        background worker AFTER a server-side scan — never by an HTTP request
+        carrying a client-supplied grade. `outcome` is a ScanOutcome from
+        core.scanner (duck-typed here to avoid a circular import).
+        """
+        return self.seed(
+            outcome.domain,
+            outcome.grade,
+            outcome.score,
+            scan_id=outcome.scan_id,
+            scanned_at=outcome.scanned_at,
+            source="scan",
         )
 
     # ── Seed helper (local/testing only — NOT an HTTP endpoint) ──────────────

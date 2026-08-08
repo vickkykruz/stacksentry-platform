@@ -4,27 +4,38 @@ Scanner
 
 The bridge between the platform and the real StackSentry package.
 
-This module does exactly one thing: given a domain that has ALREADY passed the
-SSRF guard, run a real StackSentry scan and return a normalised result the
-platform can store.
+Given a domain that has ALREADY passed the SSRF guard, this runs a real
+StackSentry scan and returns a normalised result the platform can store.
 
-Important design points:
-  - The scanner IS StackSentry. This module imports the published `stacksentry`
-    package (declared in requirements.txt) and calls its real scanning code.
-    It is not a reimplementation and not a mock.
-  - The SSRF guard MUST be called before this module. `scan_domain` re-checks
-    as a defensive belt-and-braces measure, but the platform should never even
-    reach here with an unsafe target.
-  - StackSentry may not be importable in every environment (e.g. a CI runner
-    that only tests the badge rendering). We import it lazily inside the
-    function and raise a clear error if it is missing, rather than failing at
-    module import time.
+VERIFIED AGAINST STACKSENTRY SOURCE
+-----------------------------------
+The integration below mirrors exactly what `sec_audit.cli.run_from_args` does,
+confirmed against the StackSentry source and pyproject.toml:
 
-The exact StackSentry entry point is resolved at call time. The package exposes
-its scan pipeline through `sec_audit`; we adapt to the real function signature
-on the VPS where StackSentry is installed. Until then, the integration is wired
-and tested at the boundary (import + result shape) without executing a live
-network scan from this sandbox.
+  - pyproject installs these as top-level importable packages:
+        sec_audit, checks, scanners, reporting, storage, remediation
+  - The HTTP scanner:      from scanners.http_scanner import HttpScanner
+  - Quick-mode app checks: from checks.app_checks import (...)
+  - Quick-mode WS checks:  from checks.webserver_checks import (...)
+  - The result object:     from sec_audit.results import ScanResult
+  - ScanResult(target=..., mode=..., checks=[...])
+  - ScanResult.grade            -> Grade enum; string is .grade.value ("A".."F")
+  - ScanResult.score_percentage -> float 0..100 (already rounded)
+  - ScanResult.attack_path_count-> int
+  - ScanResult.generated_at     -> ISO timestamp string (auto-set)
+
+WHY WE DON'T CALL run_from_args DIRECTLY
+----------------------------------------
+`run_from_args` prints to stdout, saves to history, and returns None — it never
+hands back the ScanResult. For a web platform we want the object, not console
+output. So we assemble the same quick-mode ScanResult here and read it directly.
+This is the same public API run_from_args uses, not a private reimplementation.
+
+QUICK MODE ONLY FOR PUBLIC BADGES
+---------------------------------
+Public badge scans use mode="quick" — HTTP layer only. The platform cannot (and
+must not) SSH into an arbitrary third party's server, so host/container checks
+do not apply to a public target. Quick mode runs the 6 app + 6 webserver checks.
 """
 
 from __future__ import annotations
@@ -51,26 +62,82 @@ class ScanOutcome:
     scan_id: str
     scanned_at: datetime
     attack_paths: int
-    raw_summary: dict   # the fuller StackSentry summary, for the verify page
+    raw_summary: dict
 
 
-def _load_stacksentry():
+def _run_quick_scan(target_url: str, *, verbose: bool = False):
     """
-    Import the real StackSentry package lazily.
+    Assemble and return a real StackSentry quick-mode ScanResult for a URL.
 
-    Returns the callable used to run a scan. Raises ScannerError with a clear
-    message if StackSentry is not installed in this environment.
+    Mirrors the quick-mode path of sec_audit.cli.run_from_args exactly, using
+    the same imports StackSentry itself uses. Raises ScannerError with a clear
+    message if StackSentry is not importable in this environment.
     """
     try:
-        # The real package. On the VPS this is `pip install stacksentry`.
-        import sec_audit  # noqa: F401
-        from sec_audit import cli as ss_cli  # noqa: F401
+        from scanners.http_scanner import HttpScanner
+        from sec_audit.results import ScanResult
+        from checks.app_checks import (
+            check_debug_mode,
+            check_secure_cookies,
+            check_csrf_protection,
+            check_admin_endpoints,
+            check_rate_limiting,
+            check_password_policy,
+        )
+        from checks.webserver_checks import (
+            check_hsts_header,
+            check_security_headers,
+            check_tls_version,
+            check_server_tokens,
+            check_directory_listing,
+            check_request_limits,
+        )
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise ScannerError(
             "StackSentry is not installed in this environment. "
-            "Install it with `pip install stacksentry` on the host that runs scans."
+            "Install it with `pip install stacksentry` on the host that runs "
+            "scans. Details: " + str(exc)
         ) from exc
-    return ss_cli
+
+    # Build the ScanResult exactly as run_from_args does: create it first with
+    # an empty checks list, hand it to the scanner, then populate the list.
+    results = []
+    scan_result = ScanResult(target=target_url, mode="quick", checks=results)
+
+    http_scanner = HttpScanner(target_url, timeout=10, scan_result=scan_result)
+
+    # detect_stack() is called in run_from_args before the checks; it primes the
+    # scanner's stack fingerprint (PHP/SPA/webserver detection).
+    try:
+        http_scanner.detect_stack()
+    except Exception:
+        # Stack detection is best-effort; a failure here must not abort the
+        # scan. Each check has its own guard clauses.
+        pass
+
+    # Web Application layer (6 checks) — always run in quick mode.
+    results.extend([
+        check_debug_mode(http_scanner, verbose=verbose),
+        check_secure_cookies(http_scanner, verbose=verbose),
+        check_csrf_protection(http_scanner, verbose=verbose),
+        check_admin_endpoints(http_scanner, verbose=verbose),
+        check_rate_limiting(http_scanner, verbose=verbose),
+        check_password_policy(http_scanner, verbose=verbose),
+    ])
+
+    # Web Server layer (6 checks) — always run in quick mode.
+    results.extend([
+        check_hsts_header(http_scanner, verbose=verbose),
+        check_security_headers(http_scanner, verbose=verbose),
+        check_tls_version(http_scanner, verbose=verbose),
+        check_server_tokens(http_scanner, verbose=verbose),
+        check_directory_listing(http_scanner, verbose=verbose),
+        check_request_limits(http_scanner, verbose=verbose),
+    ])
+
+    # Attach final results (run_from_args does this same reassignment).
+    scan_result.checks = results
+    return scan_result
 
 
 def scan_domain(domain: str, *, mode: str = "quick") -> ScanOutcome:
@@ -80,61 +147,70 @@ def scan_domain(domain: str, *, mode: str = "quick") -> ScanOutcome:
     Parameters
     ----------
     domain : str
-        The domain to scan. MUST have passed check_target() already; we
-        re-verify here defensively.
+        Domain to scan. MUST have passed check_target() already; re-verified here.
     mode : str
-        "quick" (HTTP only) or "full". Public badge scans use "quick" — the
-        platform cannot SSH into someone else's server, so only the HTTP-layer
-        checks apply to an arbitrary public target.
+        Only "quick" is supported for public scans (HTTP layer only).
 
     Raises
     ------
-    TargetBlockedError
-        If the target fails the SSRF guard.
-    ScannerError
-        If StackSentry is unavailable or the scan fails.
+    TargetBlockedError : the target fails the SSRF guard.
+    ScannerError       : StackSentry unavailable, or the scan failed.
     """
-    # Defensive re-check. The caller should have done this already.
+    if mode != "quick":
+        raise ScannerError(
+            "public scans support only mode='quick' (HTTP layer). Full-stack "
+            "scanning needs SSH/Docker access to the target host."
+        )
+
+    # Defensive re-check. The caller should already have done this.
     guard = check_target(domain)
     if not guard.allowed:
         raise TargetBlockedError(f"target blocked: {guard.reason}")
 
-    ss_cli = _load_stacksentry()
+    # StackSentry expects a full URL; scan over https (TLS/HSTS checks need it).
+    target_url = domain if "://" in domain else f"https://{guard.hostname}"
 
-    # NOTE ON EXECUTION:
-    # The precise call into StackSentry's pipeline is finalised on the VPS,
-    # against the installed package's real function signature. StackSentry
-    # produces a ScanResult with `.grade`, `.score`/`.pass_rate`, and
-    # `.attack_path_count`. We map those onto ScanOutcome below.
-    #
-    # This function is deliberately the ONLY place that calls StackSentry, so
-    # when the pipeline entry point is wired on the server, it changes here and
-    # nowhere else.
-    raise ScannerError(
-        "scan_domain is wired to StackSentry but not executed in this "
-        "environment. Run on the VPS where `stacksentry` and outbound network "
-        "access are available."
-    )
+    try:
+        scan_result = _run_quick_scan(target_url)
+    except ScannerError:
+        raise
+    except Exception as exc:  # pragma: no cover - live-scan runtime errors
+        raise ScannerError(f"scan failed for {domain}: {exc}") from exc
+
+    return outcome_from_scan_result(guard.hostname or domain, scan_result)
 
 
 def outcome_from_scan_result(domain: str, result) -> ScanOutcome:
     """
-    Map a StackSentry ScanResult object onto our ScanOutcome.
+    Map a StackSentry ScanResult onto our ScanOutcome.
 
-    Kept separate and pure so it can be unit-tested with a stub result object
+    Pure and side-effect free, so it is unit-tested with a stub result object
     without importing or running StackSentry. This is the contract between
     StackSentry's output and what the platform stores.
+
+    Handles the real ScanResult API where `.grade` is a Grade enum (so we read
+    `.grade.value`), while tolerating a plain-string grade from stubs.
     """
-    grade = getattr(result, "grade", None)
-    # StackSentry exposes the percentage as either `score_percentage` or via
-    # `pass_rate` (0..1). Support both, preferring an explicit percentage.
+    # .grade is a Grade enum on the real object; .value gives "A".."F".
+    grade_attr = getattr(result, "grade", None)
+    grade = getattr(grade_attr, "value", grade_attr)  # enum -> str, or str as-is
+
+    # Real object exposes score_percentage (0..100). Fall back to pass_rate.
     score = getattr(result, "score_percentage", None)
     if score is None:
         pr = getattr(result, "pass_rate", None)
-        score = round(pr * 100, 1) if pr is not None else 0.0
+        if pr is not None:
+            # Real pass_rate is 0..100; a stub might use 0..1.
+            score = pr if pr > 1 else round(pr * 100, 1)
+        else:
+            score = 0.0
 
     attack_paths = getattr(result, "attack_path_count", 0)
-    scan_id = getattr(result, "scan_id", None) or f"scan-{domain}-{int(datetime.now(timezone.utc).timestamp())}"
+
+    # ScanResult has no scan_id of its own; use generated_at + domain, or synthesise.
+    generated_at = getattr(result, "generated_at", None)
+    scan_id = f"{domain}-{generated_at}" if generated_at else \
+        f"scan-{domain}-{int(datetime.now(timezone.utc).timestamp())}"
 
     return ScanOutcome(
         domain=domain,
@@ -147,5 +223,6 @@ def outcome_from_scan_result(domain: str, result) -> ScanOutcome:
             "grade": grade,
             "score": score,
             "attack_paths": attack_paths,
+            "generated_at": generated_at,
         },
     )

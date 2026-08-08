@@ -127,3 +127,45 @@ def test_count(store):
     store.seed("a.com", "A", 95.0)
     store.seed("b.com", "B", 82.0)
     assert store.count() == 2
+
+
+# ── Job tracking (added for the async queue) ─────────────────────────────────
+
+def test_mark_queued_and_pending(store):
+    assert store.mark_queued("example.com") is True
+    assert store.is_pending("example.com") is True
+    assert store.job_status("example.com") == "queued"
+
+
+def test_mark_queued_dedupes(store):
+    store.mark_queued("example.com")
+    # Second call returns False — already pending.
+    assert store.mark_queued("example.com") is False
+
+
+def test_job_lifecycle(store):
+    store.mark_queued("example.com")
+    store.mark_running("example.com")
+    assert store.job_status("example.com") == "running"
+    assert store.is_pending("example.com") is True     # running counts as pending
+    store.mark_done("example.com")
+    assert store.job_status("example.com") == "done"
+    assert store.is_pending("example.com") is False
+
+
+def test_mark_error_records_detail(store):
+    store.mark_queued("example.com")
+    store.mark_error("example.com", "something broke")
+    assert store.job_status("example.com") == "error"
+
+
+def test_save_outcome_writes_grade(store):
+    from core.scanner import ScanOutcome
+    from datetime import datetime, timezone
+    outcome = ScanOutcome(
+        domain="example.com", grade="B", score=82.0, scan_id="x",
+        scanned_at=datetime.now(timezone.utc), attack_paths=0, raw_summary={},
+    )
+    rec = store.save_outcome(outcome)
+    assert rec.grade == "B"
+    assert store.get_grade("example.com").source == "scan"

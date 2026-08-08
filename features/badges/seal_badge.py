@@ -47,6 +47,7 @@ STATE_COLOURS = {
     "stale":      {"bg": "#78716C", "sub": "#E7E5E4"},
     "error":      {"bg": "#991B1B", "sub": "#FECACA"},
     "unverified": {"bg": "#6B7280", "sub": "#D1D5DB"},
+    "pending":    {"bg": "#0E7490", "sub": "#A5F3FC"},   # teal — scan in progress
 }
 
 # Rough character width for the pill's top/bottom label text at their sizes.

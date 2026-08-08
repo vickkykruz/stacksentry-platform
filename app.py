@@ -24,7 +24,16 @@ def create_app() -> Flask:
 
     # ── Register enabled features ────────────────────────────────────────────
     # Badges (Idea 1) — the first live feature.
-    init_badges(store)
+    # The enqueue function pushes scan jobs to the Celery worker. It is imported
+    # lazily so the app can start even if the broker is momentarily unavailable;
+    # a scan simply won't be queued until the worker/broker are up.
+    try:
+        from core.scan_queue import enqueue_celery
+        enqueue = enqueue_celery
+    except Exception:
+        enqueue = None
+
+    init_badges(store, enqueue=enqueue)
     app.register_blueprint(badges_bp)
 
     # Future features register here as they are built:
